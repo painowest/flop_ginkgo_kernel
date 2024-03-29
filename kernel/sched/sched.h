@@ -1240,7 +1240,7 @@ extern void sched_ttwu_pending(void);
 
 /*
  * The domain tree (rq->sd) is protected by RCU's quiescent state transition.
- * See detach_destroy_domains: synchronize_sched for details.
+ * See destroy_sched_domains: call_rcu for details.
  *
  * The domain tree of any CPU may only be accessed from within
  * preempt-disabled sections.
@@ -1453,12 +1453,7 @@ static inline void __set_task_cpu(struct task_struct *p, unsigned int cpu)
 /*
  * Tunables that become constants when CONFIG_SCHED_DEBUG is off:
  */
-#ifdef CONFIG_SCHED_DEBUG
-# include <linux/static_key.h>
-# define const_debug __read_mostly
-#else
-# define const_debug const
-#endif
+#define const_debug __read_mostly
 
 extern const_debug unsigned int sysctl_sched_features;
 

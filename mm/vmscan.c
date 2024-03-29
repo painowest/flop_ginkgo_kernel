@@ -157,14 +157,7 @@ struct scan_control {
 /*
  * From 0 .. 100.  Higher means more swappy.
  */
-int vm_swappiness = 80;
-
-#ifdef CONFIG_OPLUS_MM_HACKS
-/*
- * Direct reclaim swappiness, values range from 0 .. 60. Higher means more swappy.
- */
-int direct_vm_swappiness = 60;
-#endif /* CONFIG_OPLUS_MM_HACKS */
+int vm_swappiness = 100;
 
 /*
  * The total number of pages which are beyond the high watermark within all
@@ -355,18 +348,9 @@ static unsigned long do_shrink_slab(struct shrink_control *shrinkctl,
 	nr = atomic_long_xchg(&shrinker->nr_deferred[nid], 0);
 
 	total_scan = nr;
-	if (shrinker->seeks) {
-		delta = freeable >> priority;
-		delta *= 4;
-		do_div(delta, shrinker->seeks);
-	} else {
-		/*
-		 * These objects don't require any IO to create. Trim
-		 * them aggressively under memory pressure to keep
-		 * them from causing refetches in the IO caches.
-		 */
-		delta = freeable / 2;
-	}
+	delta = freeable >> priority;
+	delta *= 4;
+	do_div(delta, shrinker->seeks);
 
 	total_scan += delta;
 	if (total_scan < 0) {
@@ -1846,10 +1830,6 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
  */
 static int current_may_throttle(void)
 {
-#ifdef CONFIG_OPLUS_MM_HACKS
-	if ((current->signal->oom_score_adj < 0))
-		return 0;
-#endif /* CONFIG_OPLUS_MM_HACKS */
 	return !(current->flags & PF_LESS_THROTTLE) ||
 		current->backing_dev_info == NULL ||
 		bdi_write_congested(current->backing_dev_info);
@@ -2186,62 +2166,6 @@ static void shrink_active_list(unsigned long nr_to_scan,
 			nr_deactivate, nr_rotated, sc->priority, file);
 }
 
-unsigned long reclaim_pages(struct list_head *page_list)
-{
-	int nid = -1;
-	unsigned long nr_reclaimed = 0;
-	LIST_HEAD(node_page_list);
-	struct reclaim_stat dummy_stat;
-	struct page *page;
-	struct scan_control sc = {
-		.gfp_mask = GFP_KERNEL,
-		.priority = DEF_PRIORITY,
-		.may_writepage = 1,
-		.may_unmap = 1,
-		.may_swap = 1,
-	};
-
-	while (!list_empty(page_list)) {
-		page = lru_to_page(page_list);
-		if (nid == -1) {
-			nid = page_to_nid(page);
-			INIT_LIST_HEAD(&node_page_list);
-		}
-
-		if (nid == page_to_nid(page)) {
-			ClearPageActive(page);
-			list_move(&page->lru, &node_page_list);
-			continue;
-		}
-
-		nr_reclaimed += shrink_page_list(&node_page_list,
-						NODE_DATA(nid),
-						&sc, 0,
-						&dummy_stat, false);
-		while (!list_empty(&node_page_list)) {
-			page = lru_to_page(&node_page_list);
-			list_del(&page->lru);
-			putback_lru_page(page);
-		}
-
-		nid = -1;
-	}
-
-	if (!list_empty(&node_page_list)) {
-		nr_reclaimed += shrink_page_list(&node_page_list,
-						NODE_DATA(nid),
-						&sc, 0,
-						&dummy_stat, false);
-		while (!list_empty(&node_page_list)) {
-			page = lru_to_page(&node_page_list);
-			list_del(&page->lru);
-			putback_lru_page(page);
-		}
-	}
-
-	return nr_reclaimed;
-}
-
 /*
  * The inactive anon list should be small enough that the VM never has
  * to do too much work.
@@ -2301,13 +2225,8 @@ static bool inactive_list_is_low(struct lruvec *lruvec, bool file,
 		inactive_ratio = 0;
 	} else {
 		gb = (inactive + active) >> (30 - PAGE_SHIFT);
-#ifdef CONFIG_OPLUS_MM_HACKS
-		if (file && gb)
-			inactive_ratio = min(2UL, int_sqrt(10 * gb));
-#else
 		if (gb)
 			inactive_ratio = int_sqrt(10 * gb);
-#endif /* CONFIG_OPLUS_MM_HACKS */
 		else
 			inactive_ratio = 1;
 	}
@@ -2363,18 +2282,9 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
 	unsigned long anon, file;
 	unsigned long ap, fp;
 	enum lru_list lru;
-#ifdef CONFIG_OPLUS_MM_HACKS
-	unsigned long totalswap = total_swap_pages;
-#endif /* CONFIG_OPLUS_MM_HACKS */
 
-#ifdef CONFIG_OPLUS_MM_HACKS
-	if (!current_is_kswapd())
-		swappiness = direct_vm_swappiness;
-	if (!sc->may_swap || (mem_cgroup_get_nr_swap_pages(memcg) <= totalswap>>6)) {
-#else
 	/* If we have no swap space, do not bother scanning anon pages. */
 	if (!sc->may_swap || mem_cgroup_get_nr_swap_pages(memcg) <= 0) {
-#endif /* CONFIG_OPLUS_MM_HACKS */
 		scan_balance = SCAN_FILE;
 		goto out;
 	}

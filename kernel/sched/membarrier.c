@@ -30,6 +30,8 @@
 	(MEMBARRIER_CMD_SHARED | MEMBARRIER_CMD_PRIVATE_EXPEDITED	\
 	| MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
 
+static DEFINE_MUTEX(membarrier_ipi_mutex);
+
 static void ipi_mb(void *info)
 {
 	smp_mb();	/* IPIs should be serializing but paranoid. */
@@ -64,6 +66,7 @@ static int membarrier_private_expedited(void)
 		fallback = true;
 	}
 
+	mutex_lock(&membarrier_ipi_mutex);
 	cpus_read_lock();
 	for_each_online_cpu(cpu) {
 		struct task_struct *p;
@@ -79,7 +82,7 @@ static int membarrier_private_expedited(void)
 		if (cpu == raw_smp_processor_id())
 			continue;
 		rcu_read_lock();
-		p = task_rcu_dereference(&cpu_rq(cpu)->curr);
+		p = rcu_dereference(cpu_rq(cpu)->curr);
 		if (p && p->mm == current->mm) {
 			if (!fallback)
 				__cpumask_set_cpu(cpu, tmpmask);
@@ -102,6 +105,7 @@ static int membarrier_private_expedited(void)
 	 * rq->curr modification in scheduler.
 	 */
 	smp_mb();	/* exit from system call is not a mb */
+	mutex_unlock(&membarrier_ipi_mutex);
 	return 0;
 }
 
@@ -167,7 +171,7 @@ SYSCALL_DEFINE2(membarrier, int, cmd, int, flags)
 		if (tick_nohz_full_enabled())
 			return -EINVAL;
 		if (num_online_cpus() > 1)
-			synchronize_sched();
+			synchronize_rcu();
 		return 0;
 	case MEMBARRIER_CMD_PRIVATE_EXPEDITED:
 		return membarrier_private_expedited();
