@@ -314,21 +314,9 @@ compound_page_dtor * const compound_page_dtors[] = {
 #endif
 };
 
-/*
- * Try to keep at least this much lowmem free.  Do not allow normal
- * allocations below this point, only high priority ones. Automatically
- * tuned according to the amount of memory in the system.
- */
 int min_free_kbytes = 1024;
 int user_min_free_kbytes = -1;
-int watermark_scale_factor = 100;
-
-/*
- * Extra memory for the system to try freeing. Used to temporarily
- * free memory, to make space for new workloads. Anyone can allocate
- * down to the min watermarks controlled by min_free_kbytes above.
- */
-int extra_free_kbytes = 0;
+int watermark_scale_factor = 32;
 
 static unsigned long __meminitdata nr_kernel_pages;
 static unsigned long __meminitdata nr_all_pages;
@@ -1819,11 +1807,11 @@ static bool check_new_pcp(struct page *page)
 	return check_new_page(page);
 }
 #else
-static bool check_pcp_refill(struct page *page)
+static inline bool check_pcp_refill(struct page *page)
 {
-	return check_new_page(page);
+	return false;
 }
-static bool check_new_pcp(struct page *page)
+static inline bool check_new_pcp(struct page *page)
 {
 	return false;
 }
@@ -3221,11 +3209,15 @@ static inline bool zone_watermark_fast(struct zone *z, unsigned int order,
 	 * need to be calculated.
 	 */
 	if (!order) {
-		long fast_free;
+		long usable_free;
+		long reserved;
 
-		fast_free = free_pages;
-		fast_free -= __zone_watermark_unusable_free(z, 0, alloc_flags);
-		if (fast_free > mark + z->lowmem_reserve[classzone_idx])
+		usable_free = free_pages;
+		reserved = __zone_watermark_unusable_free(z, 0, alloc_flags);
+
+		/* reserved may over estimate high-atomic reserves. */
+		usable_free -= min(usable_free, reserved);
+		if (usable_free > mark + z->lowmem_reserve[classzone_idx])
 			return true;
 	}
 
@@ -3600,46 +3592,6 @@ __alloc_pages_direct_compact(gfp_t gfp_mask, unsigned int order,
 	return NULL;
 }
 
-#ifdef CONFIG_HAVE_LOW_MEMORY_KILLER
-static inline bool
-should_compact_lmk_retry(struct alloc_context *ac, int order, int alloc_flags)
-{
-	struct zone *zone;
-	struct zoneref *z;
-
-	/* Let costly order requests check for compaction progress */
-	if (order > PAGE_ALLOC_COSTLY_ORDER)
-		return false;
-
-	/*
-	 * For (0 < order < PAGE_ALLOC_COSTLY_ORDER) allow the shrinkers
-	 * to run and free up memory. Do not let these allocations fail
-	 * if shrinkers can free up memory. This is similar to
-	 * should_compact_retry implementation for !CONFIG_COMPACTION.
-	 */
-	for_each_zone_zonelist_nodemask(zone, z, ac->zonelist,
-				ac->high_zoneidx, ac->nodemask) {
-		unsigned long available;
-
-		available = zone_reclaimable_pages(zone);
-		available +=
-			zone_page_state_snapshot(zone, NR_FREE_PAGES);
-
-		if (__zone_watermark_ok(zone, 0, min_wmark_pages(zone),
-			ac_classzone_idx(ac), alloc_flags, available))
-			return true;
-	}
-
-	return false;
-}
-#else
-static inline bool
-should_compact_lmk_retry(struct alloc_context *ac, int order, int alloc_flags)
-{
-	return false;
-}
-#endif
-
 static inline bool
 should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 		     enum compact_result compact_result,
@@ -3655,9 +3607,6 @@ should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 	if (!order)
 		return false;
 
-	if (should_compact_lmk_retry(ac, order, alloc_flags))
-		return true;
-
 	if (compaction_made_progress(compact_result))
 		(*compaction_retries)++;
 
@@ -3670,14 +3619,22 @@ should_compact_retry(struct alloc_context *ac, int order, int alloc_flags,
 		goto check_priority;
 
 	/*
-	 * make sure the compaction wasn't deferred or didn't bail out early
-	 * due to locks contention before we declare that we should give up.
-	 * But do not retry if the given zonelist is not suitable for
-	 * compaction.
+	 * compaction was skipped because there are not enough order-0 pages
+	 * to work with, so we retry only if it looks like reclaim can help.
 	 */
-	if (compaction_withdrawn(compact_result)) {
+	if (compaction_needs_reclaim(compact_result)) {
 		ret = compaction_zonelist_suitable(ac, order, alloc_flags);
 		goto out;
+	}
+
+	/*
+	 * make sure the compaction wasn't deferred or didn't bail out early
+	 * due to locks contention before we declare that we should give up.
+	 * But the next retry should use a higher priority if allowed, so
+	 * we don't just keep bailing out endlessly.
+	 */
+	if (compaction_withdrawn(compact_result)) {
+		goto check_priority;
 	}
 
 	/*
@@ -3707,6 +3664,12 @@ check_priority:
 		(*compact_priority)--;
 		*compaction_retries = 0;
 		ret = true;
+	} else if (order <= PAGE_ALLOC_COSTLY_ORDER) {
+		/*
+		 * If it's non-alloc-costly order and has enough reclaimable
+		 * memory, retries further to prevent premature OOM kill.
+		 */
+		ret = compaction_zonelist_suitable(ac, order, alloc_flags);
 	}
 out:
 	trace_compact_retry(order, priority, compact_result, retries, max_retries, ret);
@@ -3999,14 +3962,9 @@ should_reclaim_retry(gfp_t gfp_mask, unsigned order,
 	 * their order will become available due to high fragmentation so
 	 * always increment the no progress counter for them
 	 */
-	if ((did_some_progress || lmk_kill_possible()) &&
-				order <= PAGE_ALLOC_COSTLY_ORDER) {
-
+	if (did_some_progress && order <= PAGE_ALLOC_COSTLY_ORDER)
 		*no_progress_loops = 0;
-
-		if (lmk_kill_possible())
-			return true;
-	} else
+	else
 		(*no_progress_loops)++;
 
 	/*
@@ -4229,7 +4187,7 @@ retry:
 
 	/* Boost when memory is low so allocation latency doesn't get too bad */
 	cpu_input_boost_kick_max(100);
-	devfreq_boost_kick_max(DEVFREQ_MSM_CPUBW, 100);
+	devfreq_boost_kick_max(DEVFREQ_CPU_DDR_BW, 100);
 
 	reserve_flags = __gfp_pfmemalloc_flags(gfp_mask);
 	if (reserve_flags)
@@ -4258,10 +4216,6 @@ retry:
 	if (current->flags & PF_MEMALLOC)
 		goto nopage;
 
-	if (fatal_signal_pending(current) && !(gfp_mask & __GFP_NOFAIL) &&
-			(gfp_mask & __GFP_FS))
-		goto nopage;
-
 	/* Try direct reclaim and then allocating */
 	page = __alloc_pages_direct_reclaim(gfp_mask, order, alloc_flags, ac,
 							&did_some_progress);
@@ -4287,7 +4241,7 @@ retry:
 		goto nopage;
 
 	/* Boost when memory is low so allocation latency doesn't get too bad */
-	devfreq_boost_kick_max(DEVFREQ_MSM_CPUBW, 100);
+	devfreq_boost_kick_max(DEVFREQ_CPU_DDR_BW, 100);
 
 	if (should_reclaim_retry(gfp_mask, order, ac, alloc_flags,
 				 did_some_progress > 0, &no_progress_loops))
@@ -4299,12 +4253,11 @@ retry:
 	 * implementation of the compaction depends on the sufficient amount
 	 * of free memory (see __compaction_suitable)
 	 */
-	if (((did_some_progress > 0 && can_compact) || lmk_kill_possible()) &&
+	if (did_some_progress > 0 && can_compact &&
 			should_compact_retry(ac, order, alloc_flags,
 				compact_result, &compact_priority,
 				&compaction_retries))
 		goto retry;
-
 
 	/*
 	 * Deal with possible cpuset update races or zonelist updates to avoid
@@ -7246,7 +7199,6 @@ static void setup_per_zone_lowmem_reserve(void)
 static void __setup_per_zone_wmarks(void)
 {
 	unsigned long pages_min = min_free_kbytes >> (PAGE_SHIFT - 10);
-	unsigned long pages_low = extra_free_kbytes >> (PAGE_SHIFT - 10);
 	unsigned long lowmem_pages = 0;
 	struct zone *zone;
 	unsigned long flags;
@@ -7258,14 +7210,11 @@ static void __setup_per_zone_wmarks(void)
 	}
 
 	for_each_zone(zone) {
-		u64 min, low;
+		u64 tmp;
 
 		spin_lock_irqsave(&zone->lock, flags);
-		min = (u64)pages_min * zone_managed_pages(zone);
-		do_div(min, lowmem_pages);
-		low = (u64)pages_low * zone_managed_pages(zone);
-		do_div(low, vm_total_pages);
-
+		tmp = (u64)pages_min * zone_managed_pages(zone);
+		do_div(tmp, lowmem_pages);
 		if (is_highmem(zone)) {
 			/*
 			 * __GFP_HIGH and PF_MEMALLOC allocations usually don't
@@ -7286,7 +7235,7 @@ static void __setup_per_zone_wmarks(void)
 			 * If it's a lowmem zone, reserve a number of pages
 			 * proportionate to the zone's size.
 			 */
-			zone->watermark[WMARK_MIN] = min;
+			zone->watermark[WMARK_MIN] = tmp;
 		}
 
 		/*
@@ -7294,14 +7243,12 @@ static void __setup_per_zone_wmarks(void)
 		 * scale factor in proportion to available memory, but
 		 * ensure a minimum size on small systems.
 		 */
-		min = max_t(u64, min >> 2,
+		tmp = max_t(u64, tmp >> 2,
 			    mult_frac(zone_managed_pages(zone),
 				      watermark_scale_factor, 10000));
 
-		zone->watermark[WMARK_LOW]  = min_wmark_pages(zone) +
-					low + min;
-		zone->watermark[WMARK_HIGH] = min_wmark_pages(zone) +
-					low + min * 2;
+		zone->watermark[WMARK_LOW]  = min_wmark_pages(zone) + tmp;
+		zone->watermark[WMARK_HIGH] = min_wmark_pages(zone) + tmp * 2;
 
 		spin_unlock_irqrestore(&zone->lock, flags);
 	}
@@ -7386,7 +7333,7 @@ postcore_initcall(init_per_zone_wmark_min)
 /*
  * min_free_kbytes_sysctl_handler - just a wrapper around proc_dointvec() so
  *	that we can call two helper functions whenever min_free_kbytes
- *	or extra_free_kbytes changes.
+ *	changes.
  */
 int min_free_kbytes_sysctl_handler(struct ctl_table *table, int write,
 	void __user *buffer, size_t *length, loff_t *ppos)

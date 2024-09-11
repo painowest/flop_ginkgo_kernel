@@ -159,7 +159,13 @@ struct scan_control {
 /*
  * From 0 .. 100.  Higher means more swappy.
  */
-int vm_swappiness = 180;
+int vm_swappiness = 100;
+#ifdef CONFIG_OPLUS_MM_HACKS
+/*
+ * Direct reclaim swappiness, values range from 0 .. 60. Higher means more swappy.
+ */
+int direct_vm_swappiness = 20;
+#endif /* CONFIG_OPLUS_MM_HACKS */
 
 /*
  * The total number of pages which are beyond the high watermark within all
@@ -224,7 +230,7 @@ unsigned long zone_reclaimable_pages(struct zone *zone)
 
 	nr = zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_FILE) +
 		zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_FILE);
-	if (get_nr_swap_pages() > 0 || lmk_kill_possible())
+	if (get_nr_swap_pages() > 0)
 		nr += zone_page_state_snapshot(zone, NR_ZONE_INACTIVE_ANON) +
 			zone_page_state_snapshot(zone, NR_ZONE_ACTIVE_ANON);
 
@@ -963,6 +969,7 @@ struct reclaim_stat {
 	unsigned nr_activate;
 	unsigned nr_ref_keep;
 	unsigned nr_unmap_fail;
+	unsigned nr_lazyfree_fail;
 };
 
 /*
@@ -986,6 +993,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 	unsigned nr_immediate = 0;
 	unsigned nr_ref_keep = 0;
 	unsigned nr_unmap_fail = 0;
+	unsigned nr_lazyfree_fail = 0;
 
 	cond_resched();
 
@@ -1196,11 +1204,14 @@ static unsigned long shrink_page_list(struct list_head *page_list,
 		 */
 		if (page_mapped(page)) {
 			enum ttu_flags flags = ttu_flags | TTU_BATCH_FLUSH;
+			bool was_swapbacked = PageSwapBacked(page);
 
 			if (unlikely(PageTransHuge(page)))
 				flags |= TTU_SPLIT_HUGE_PMD;
 			if (!try_to_unmap(page, flags, sc->target_vma)) {
 				nr_unmap_fail++;
+				if (!was_swapbacked && PageSwapBacked(page))
+					nr_lazyfree_fail++;
 				goto activate_locked;
 			}
 		}
@@ -1388,6 +1399,7 @@ keep:
 		stat->nr_activate = pgactivate;
 		stat->nr_ref_keep = nr_ref_keep;
 		stat->nr_unmap_fail = nr_unmap_fail;
+		stat->nr_lazyfree_fail = nr_lazyfree_fail;
 	}
 	return nr_reclaimed;
 }
@@ -1402,8 +1414,9 @@ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
 		/* Doesn't allow to write out dirty page */
 		.may_writepage = 0,
 	};
-	unsigned long ret;
 	struct page *page, *next;
+	struct reclaim_stat stat;
+	unsigned long nr_reclaimed;
 	LIST_HEAD(clean_pages);
 
 	list_for_each_entry_safe(page, next, page_list, lru) {
@@ -1414,11 +1427,21 @@ unsigned long reclaim_clean_pages_from_list(struct zone *zone,
 		}
 	}
 
-	ret = shrink_page_list(&clean_pages, zone->zone_pgdat, &sc,
-			TTU_IGNORE_ACCESS, NULL, true);
+	nr_reclaimed = shrink_page_list(&clean_pages, zone->zone_pgdat, &sc,
+			TTU_IGNORE_ACCESS, &stat, true);
 	list_splice(&clean_pages, page_list);
-	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE, -ret);
-	return ret;
+	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE, -nr_reclaimed);
+	/*
+	 * Since lazyfree pages are isolated from file LRU from the beginning,
+	 * they will rotate back to anonymous LRU in the end if it failed to
+	 * discard so isolated count will be mismatched.
+	 * Compensate the isolated count for both LRU lists.
+	 */
+	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_ANON,
+			    stat.nr_lazyfree_fail);
+	mod_node_page_state(zone->zone_pgdat, NR_ISOLATED_FILE,
+			    -stat.nr_lazyfree_fail);
+	return nr_reclaimed;
 }
 
 #ifdef CONFIG_PROCESS_RECLAIM
@@ -1833,6 +1856,10 @@ putback_inactive_pages(struct lruvec *lruvec, struct list_head *page_list)
  */
 static int current_may_throttle(void)
 {
+#ifdef CONFIG_OPLUS_MM_HACKS
+	if ((current->signal->oom_score_adj < 0))
+		return 0;
+#endif /* CONFIG_OPLUS_MM_HACKS */
 	return !(current->flags & PF_LESS_THROTTLE) ||
 		current->backing_dev_info == NULL ||
 		bdi_write_congested(current->backing_dev_info);
@@ -1861,13 +1888,13 @@ shrink_inactive_list(unsigned long nr_to_scan, struct lruvec *lruvec,
 		if (stalled)
 			return 0;
 
-		/* We are about to die and free our memory. Return now. */
-		if (fatal_signal_pending(current))
-			return SWAP_CLUSTER_MAX;
-
 		/* wait a bit for the reclaimer. */
 		msleep(100);
 		stalled = true;
+
+		/* We are about to die and free our memory. Return now. */
+		if (fatal_signal_pending(current))
+			return SWAP_CLUSTER_MAX;
 	}
 
 	lru_add_drain();
@@ -2233,8 +2260,13 @@ static bool inactive_list_is_low(struct lruvec *lruvec, bool file,
 		inactive_ratio = 0;
 	} else {
 		gb = (inactive + active) >> (30 - PAGE_SHIFT);
+#ifdef CONFIG_OPLUS_MM_HACKS
+		if (file && gb)
+			inactive_ratio = min(2UL, int_sqrt(10 * gb));
+#else
 		if (gb)
 			inactive_ratio = int_sqrt(10 * gb);
+#endif /* CONFIG_OPLUS_MM_HACKS */
 		else
 			inactive_ratio = 1;
 	}
@@ -2291,9 +2323,18 @@ static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
 	unsigned long anon, file;
 	unsigned long ap, fp;
 	enum lru_list lru;
+#ifdef CONFIG_OPLUS_MM_HACKS
+	unsigned long totalswap = total_swap_pages;
+#endif /* CONFIG_OPLUS_MM_HACKS */
 
+#ifdef CONFIG_OPLUS_MM_HACKS
+	if (!current_is_kswapd())
+		swappiness = direct_vm_swappiness;
+	if (!sc->may_swap || (mem_cgroup_get_nr_swap_pages(memcg) <= totalswap>>6)) {
+#else
 	/* If we have no swap space, do not bother scanning anon pages. */
 	if (!sc->may_swap || mem_cgroup_get_nr_swap_pages(memcg) <= 0) {
+#endif /* CONFIG_OPLUS_MM_HACKS */
 		scan_balance = SCAN_FILE;
 		goto out;
 	}
@@ -3871,7 +3912,7 @@ int kswapd_run(int nid)
 	if (pgdat->kswapd)
 		return 0;
 
-	pgdat->kswapd = kthread_run_perf_critical(cpu_perf_mask, kswapd, pgdat, "kswapd%d", nid);
+	pgdat->kswapd = kthread_run(kswapd, pgdat, "kswapd%d", nid);
 	if (IS_ERR(pgdat->kswapd)) {
 		/* failure at boot is fatal */
 		BUG_ON(system_state < SYSTEM_RUNNING);

@@ -1228,7 +1228,7 @@ typedef enum {
  * Allow userspace to control policy on scanning the unevictable LRU for
  * compactable pages.
  */
-int sysctl_compact_unevictable_allowed __read_mostly = 1;
+int sysctl_compact_unevictable_allowed __read_mostly = 0;
 
 /*
  * Isolate all pages that can be migrated from the first suitable block,
@@ -2087,7 +2087,7 @@ int kcompactd_run(int nid)
 	if (pgdat->kcompactd)
 		return 0;
 
-	pgdat->kcompactd = kthread_run_perf_critical(cpu_perf_mask, kcompactd, pgdat, "kcompactd%d", nid);
+	pgdat->kcompactd = kthread_run(kcompactd, pgdat, "kcompactd%d", nid);
 	if (IS_ERR(pgdat->kcompactd)) {
 		pr_err("Failed to start kcompactd on node %d\n", nid);
 		ret = PTR_ERR(pgdat->kcompactd);

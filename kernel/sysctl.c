@@ -109,7 +109,6 @@ extern char core_pattern[];
 extern unsigned int core_pipe_limit;
 #endif
 extern int pid_max;
-extern int extra_free_kbytes;
 extern int pid_max_min, pid_max_max;
 extern int percpu_pagelist_fraction;
 extern int latencytop_enabled;
@@ -136,6 +135,10 @@ static unsigned long zero_ul;
 static unsigned long one_ul = 1;
 static unsigned long long_max = LONG_MAX;
 static int one_hundred = 100;
+#ifdef CONFIG_OPLUS_MM_HACKS
+extern int direct_vm_swappiness;
+static int two_hundred = 200;
+#endif /* CONFIG_OPLUS_MM_HACKS */
 static int one_thousand = 1000;
 #ifdef CONFIG_PRINTK
 static int ten_thousand = 10000;
@@ -1643,7 +1646,7 @@ static struct ctl_table vm_table[] = {
 		.procname	= "dirty_background_ratio",
 		.data		= &dirty_background_ratio,
 		.maxlen		= sizeof(dirty_background_ratio),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= dirty_background_ratio_handler,
 		.extra1		= &zero,
 		.extra2		= &one_hundred,
@@ -1660,7 +1663,7 @@ static struct ctl_table vm_table[] = {
 		.procname	= "dirty_ratio",
 		.data		= &vm_dirty_ratio,
 		.maxlen		= sizeof(vm_dirty_ratio),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= dirty_ratio_handler,
 		.extra1		= &zero,
 		.extra2		= &one_hundred,
@@ -1708,8 +1711,23 @@ static struct ctl_table vm_table[] = {
 		.mode		= 0644,
 		.proc_handler	= proc_swappiness_handler,
 		.extra1		= &zero,
+#ifdef CONFIG_OPLUS_MM_HACKS
+		.extra2         = &two_hundred,
+#else
 		.extra2		= &one_hundred,
+#endif /* CONFIG_OPLUS_MM_HACKS */
 	},
+#ifdef CONFIG_OPLUS_MM_HACKS
+	{
+	        .procname	= "direct_swappiness",
+		.data		= &direct_vm_swappiness,
+		.maxlen 	= sizeof(direct_vm_swappiness),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1 	= &zero,
+		.extra2 	= &two_hundred,
+	},
+#endif /* CONFIG_OPLUS_MM_HACKS */
 	{
 		.procname       = "want_old_faultaround_pte",
 		.data           = &want_old_faultaround_pte,
@@ -1818,14 +1836,6 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= watermark_scale_factor_sysctl_handler,
 		.extra1		= &one,
 		.extra2		= &one_thousand,
-	},
-	{
-		.procname	= "extra_free_kbytes",
-		.data		= &extra_free_kbytes,
-		.maxlen		= sizeof(extra_free_kbytes),
-		.mode		= 0644,
-		.proc_handler	= min_free_kbytes_sysctl_handler,
-		.extra1		= &zero,
 	},
 	{
 		.procname	= "percpu_pagelist_fraction",
