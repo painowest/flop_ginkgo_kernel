@@ -128,7 +128,9 @@ static int __maybe_unused neg_three = -3;
 static int zero;
 static int __maybe_unused one = 1;
 static int __maybe_unused two = 2;
+#ifndef CONFIG_SCHED_BORE
 static int __maybe_unused three = 3;
+#endif // CONFIG_SCHED_BORE
 static int __maybe_unused four = 4;
 static int int_max = INT_MAX;
 static unsigned long zero_ul;
@@ -163,6 +165,20 @@ static int minolduid;
 
 static int ngroups_max = NGROUPS_MAX;
 static const int cap_last_cap = CAP_LAST_CAP;
+
+#ifdef CONFIG_SCHED_BORE
+extern uint sched_bore;
+extern uint sched_burst_score_rounding;
+extern uint sched_burst_smoothness_long;
+extern uint sched_burst_smoothness_short;
+extern uint sched_burst_fork_atavistic;
+extern uint sched_burst_penalty_offset;
+extern uint sched_burst_penalty_scale;
+extern uint sched_burst_cache_lifetime;
+static int __maybe_unused three          = 3;
+static int __maybe_unused sixty_four     = 64;
+static int __maybe_unused maxval_12_bits = 4095;
+#endif // CONFIG_SCHED_BORE
 
 /*this is needed for proc_doulongvec_minmax of sysctl_hung_task_timeout_secs */
 #ifdef CONFIG_DETECT_HUNG_TASK
@@ -1515,6 +1531,78 @@ static struct ctl_table kern_table[] = {
 		.extra2		= &one_thousand,
 	},
 #endif
+#ifdef CONFIG_SCHED_BORE
+	{
+		.procname	= "sched_bore",
+		.data		= &sched_bore,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "sched_burst_score_rounding",
+		.data		= &sched_burst_score_rounding,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "sched_burst_smoothness_long",
+		.data		= &sched_burst_smoothness_long,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "sched_burst_smoothness_short",
+		.data		= &sched_burst_smoothness_short,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &one,
+	},
+	{
+		.procname	= "sched_burst_fork_atavistic",
+		.data		= &sched_burst_fork_atavistic,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &three,
+	},
+	{
+		.procname	= "sched_burst_penalty_offset",
+		.data		= &sched_burst_penalty_offset,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &sixty_four,
+	},
+	{
+		.procname	= "sched_burst_penalty_scale",
+		.data		= &sched_burst_penalty_scale,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_douintvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &maxval_12_bits,
+	},
+	{
+		.procname	= "sched_burst_cache_lifetime",
+		.data		= &sched_burst_cache_lifetime,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_douintvec,
+	},
+#endif // CONFIG_SCHED_BORE
 	{
 		.procname	= "panic_on_warn",
 		.data		= &panic_on_warn,
@@ -1655,7 +1743,7 @@ static struct ctl_table vm_table[] = {
 		.procname	= "dirty_background_bytes",
 		.data		= &dirty_background_bytes,
 		.maxlen		= sizeof(dirty_background_bytes),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= dirty_background_bytes_handler,
 		.extra1		= &one_ul,
 	},
@@ -1672,7 +1760,7 @@ static struct ctl_table vm_table[] = {
 		.procname	= "dirty_bytes",
 		.data		= &vm_dirty_bytes,
 		.maxlen		= sizeof(vm_dirty_bytes),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= dirty_bytes_handler,
 		.extra1		= &dirty_bytes_min,
 	},
@@ -1680,14 +1768,14 @@ static struct ctl_table vm_table[] = {
 		.procname	= "dirty_writeback_centisecs",
 		.data		= &dirty_writeback_interval,
 		.maxlen		= sizeof(dirty_writeback_interval),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= dirty_writeback_centisecs_handler,
 	},
 	{
 		.procname	= "dirty_expire_centisecs",
 		.data		= &dirty_expire_interval,
 		.maxlen		= sizeof(dirty_expire_interval),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &zero,
 	},
