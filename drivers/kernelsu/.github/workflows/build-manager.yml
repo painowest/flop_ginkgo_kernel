@@ -2,25 +2,112 @@ name: Build Manager
 
 on:
   push:
-    branches: [ "main", "ci" ]
+    branches: [ "legacy", "ci" ]
     paths:
       - '.github/workflows/build-manager.yml'
       - 'manager/**'
       - 'kernel/**'
       - 'userspace/ksud/**'
   pull_request:
-    branches: [ "main" ]
+    branches: [ "legacy" ]
     paths:
       - 'manager/**'
   workflow_call:
+  workflow_dispatch:
 
 jobs:
-  build-lkm:
-    uses: ./.github/workflows/build-lkm.yml
-    secrets: inherit
+  update-signature:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: legacy
+
+
+      - name: Update unofficial build signature
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --all
+
+          if [ ! -z "${{ secrets.KEYSTORE }}" ]; then
+              KEYSTORE_PASSWORD='${{ secrets.KEYSTORE_PASSWORD }}'
+              KEY_ALIAS='${{ secrets.KEY_ALIAS }}'
+              KEY_PASSWORD='${{ secrets.KEY_PASSWORD }}'
+              KEYSTORE_FILE='key.jks'
+              echo ${{ secrets.KEYSTORE }} | base64 -d > key.jks
+
+              keytool -exportcert -file cert.crt \
+                -keystore key.jks \
+                -storepass $KEYSTORE_PASSWORD \
+                -alias $KEY_ALIAS \
+                -keypass $KEY_PASSWORD
+
+              EXPECTED_SIZE=$(printf "0x%01x" $(stat -c %s cert.crt))
+              EXPECTED_HASH=$(sha256sum -b cert.crt | cut -d ' ' -f 1)
+
+              OLD_SIG_CODE="return check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH);"
+              REPLACE_CODE="return (check_v2_signature(path, EXPECTED_SIZE, EXPECTED_HASH)\n"$'\t'"|| check_v2_signature(path, $EXPECTED_SIZE, \"$EXPECTED_HASH\")\n"$'\t'");"
+
+              sed -i "s/"$'\t'"$OLD_SIG_CODE/"$'\t'"$REPLACE_CODE/" kernel/apk_sign.c
+
+              git add kernel/apk_sign.c
+              git commit -m "kernel: Allow signature for unofficial manager"
+              git push origin legacy
+          fi
+
+  update-version:
+    needs: update-signature
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: upstream
+          path: upstream
+
+      - name: Obtain upstream version
+        id: upstream
+        run: |
+          cd $GITHUB_WORKSPACE/upstream
+          git fetch --all
+
+          UPSTREAM_VALUE=$(sed -nE 's/return major \* 10000 \+ commitCount \+ ([[:digit:]]+)/\1/p' manager/build.gradle.kts)
+          echo "UPSTREAM_VALUE=$UPSTREAM_VALUE" >> $GITHUB_OUTPUT
+
+      - name: Checkout legacy
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: legacy
+          path: legacy
+
+      - name: Update legacy version
+        env:
+          UPSTREAM_VALUE: ${{ steps.upstream.outputs.UPSTREAM_VALUE }}
+        run: |
+          cd $GITHUB_WORKSPACE/legacy
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --all
+
+          VALUE_AFTER_OFFSET=$((UPSTREAM_VALUE - 1 - $(git rev-list --count origin/upstream..origin/legacy)))
+
+          sed -i -E 's/(return major \* 10000 \+ commitCount \+ )[[:digit:]]+/\1'$VALUE_AFTER_OFFSET'/i' manager/build.gradle.kts
+          sed -i -E 's/(\$\(shell expr 10000 \+ \$\(KSU_GIT_VERSION\) \+ )[[:digit:]]+/\1'$VALUE_AFTER_OFFSET'/i' kernel/Makefile
+          sed -i -E 's/(\= 10000 \+ )[[:digit:]]+( \+ version_code)/\1'$VALUE_AFTER_OFFSET'\2/i' userspace/ksud/build.rs
+
+          git add .
+          git commit -m "treewide: Offset build version to match with upstream"
+          git push origin legacy
 
   build-ksud:
-    needs: build-lkm
+    needs: update-version
     strategy:
       matrix:
         include:
@@ -28,20 +115,11 @@ jobs:
             os: ubuntu-latest
           - target: x86_64-linux-android
             os: ubuntu-latest
-          - target: x86_64-pc-windows-gnu # windows pc
-            os: ubuntu-latest
-          - target: x86_64-apple-darwin # Intel mac
-            os: macos-latest
-          - target: aarch64-apple-darwin # M chip mac
-            os: macos-latest
-          - target: aarch64-unknown-linux-musl # arm64 Linux
-            os: ubuntu-latest
-          - target: x86_64-unknown-linux-musl # x86 Linux
-            os: ubuntu-latest
     uses: ./.github/workflows/ksud.yml
     with:
       target: ${{ matrix.target }}
       os: ${{ matrix.os }}
+      pack_lkm: false
 
   build-manager:
     needs: build-ksud
@@ -55,6 +133,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: legacy
 
       - name: Setup need_upload
         id: need_upload
@@ -66,7 +145,7 @@ jobs:
           fi
 
       - name: Write key
-        if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/main' ) || github.ref_type == 'tag' }}
+        if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/legacy' ) || github.ref_type == 'tag' }}
         run: |
           if [ ! -z "${{ secrets.KEYSTORE }}" ]; then
             {
@@ -85,9 +164,10 @@ jobs:
           java-version: 21
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-home-cache-cleanup: true
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Download arm64 ksud
         uses: actions/download-artifact@v4
@@ -121,14 +201,14 @@ jobs:
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
-        if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/main' ) || github.ref_type == 'tag' }}
+        if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/legacy' ) || github.ref_type == 'tag' }}
         with:
           name: manager
           path: manager/app/build/outputs/apk/release/*.apk
 
       - name: Upload mappings
         uses: actions/upload-artifact@v4
-        if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/main' ) || github.ref_type == 'tag' }}
+        if: ${{ ( github.event_name != 'pull_request' && github.ref == 'refs/heads/legacy' ) || github.ref_type == 'tag' }}
         with:
           name: "mappings"
           path: "manager/app/build/outputs/mapping/release/"
